@@ -26,3 +26,4 @@ set_global_assignment -name VHDL_FILE cv_clock.vhd
 set_global_assignment -name VHDL_FILE cv_por.vhd
 set_global_assignment -name VHDL_FILE cv_console.vhd
 set_global_assignment -name SYSTEMVERILOG_FILE ColecoVision.sv
+set_global_assignment -name VERILOG_FILE joydb9md.v
