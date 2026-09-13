@@ -258,13 +258,13 @@ assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
  
-assign LED_USER   = ioctl_download;
+assign LED_USER   = ioctl_download | ss_busy;
 assign LED_DISK   = 0;
 assign LED_POWER  = 0;
 assign BUTTONS    = 0;
 assign VGA_SCALER = 0;
 assign VGA_DISABLE= 0;
-assign HDMI_FREEZE= 0;
+assign HDMI_FREEZE= ss_frz;
 assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
 
@@ -304,8 +304,25 @@ parameter CONF_STR = {
 	"O3,Joysticks swap,No,Yes;",
 	"-;",
 	"O45,RAM Size,1KB,8KB,SGM;",
+	"-;",
+	"S0,SST,Savestate file;",
+	"OCE,Savestate slot,1,2,3,4,5,6,7,8;",
+	"RF,Save state (Shift+F1-F8);",
+	"RG,Load state (F1-F8);",
+	"-;",
 	"R0,Reset;",
-	"J1,Fire 1,Fire 2,*,#,0,1,2,3,4,5,6,7,8,9,Purple Tr,Blue Tr;",
+	"J1,Fire 1,Fire 2,*,#,0,1,2,3,4,5,6,7,8,9,Purple Tr,Blue Tr,Savestates;",
+	"I,",
+	"Slot=LEFT/RIGHT  Save=DOWN  Load=UP,",
+	"Slot 1,","Slot 2,","Slot 3,","Slot 4,","Slot 5,","Slot 6,","Slot 7,","Slot 8,",
+	"Saved to slot 1,","Loaded slot 1,",
+	"Saved to slot 2,","Loaded slot 2,",
+	"Saved to slot 3,","Loaded slot 3,",
+	"Saved to slot 4,","Loaded slot 4,",
+	"Saved to slot 5,","Loaded slot 5,",
+	"Saved to slot 6,","Loaded slot 6,",
+	"Saved to slot 7,","Loaded slot 7,",
+	"Saved to slot 8,","Loaded slot 8;",
 	"V,v",`BUILD_DATE
 };
 
@@ -328,8 +345,8 @@ always @(posedge clk_sys) begin
 	reg [2:0] div;
 	
 	div <= div+1'd1;
-	ce_10m7 <= !div[1:0];
-	ce_5m3  <= !div[2:0];
+	ce_10m7 <= !div[1:0] & ~ss_frz;
+	ce_5m3  <= !div[2:0] & ~ss_frz;
 end
 
 /////////////////  HPS  ///////////////////////////
@@ -338,6 +355,8 @@ end
 wire [127:0] status;
 // [MiSTer-DB9 END]
 wire  [1:0] buttons;
+
+wire [127:0] status_in = {status[127:15], ss_slot, status[11:0]};
 
 wire [31:0] joy0_USB, joy1_USB;
 
@@ -348,6 +367,20 @@ wire [24:0] ioctl_addr;
 wire  [7:0] ioctl_dout;
 wire        forced_scandoubler;
 wire [21:0] gamma_bus;
+wire [10:0] ps2_key;
+
+wire [31:0] sd_lba[1];
+wire  [5:0] sd_blk_cnt[1];
+wire        sd_rd;
+wire        sd_wr;
+wire        sd_ack;
+wire [13:0] sd_buff_addr;
+wire  [7:0] sd_buff_dout;
+wire  [7:0] sd_buff_din[1];
+wire        sd_buff_wr;
+wire        img_mounted;
+wire        img_readonly;
+wire [63:0] img_size;
  
 // L S F6 F5 F4 F3 F2 F1 U D L R 
 wire [31:0] joy0 = joydb_1ena ? (OSD_STATUS? 32'b000000 : joydb_1_mapped[11:0]) : joy0_USB;
@@ -365,6 +398,10 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 
 	.buttons(buttons),
 	.status(status),
+	.status_in(status_in),
+	.status_set(ss_status_upd),
+	.info_req(ss_info_req),
+	.info(ss_info),
 	.forced_scandoubler(forced_scandoubler),
 	.gamma_bus(gamma_bus),
 
@@ -386,6 +423,21 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	// [MiSTer-DB9-Pro BEGIN] - Saturn key gate
 	.saturn_unlocked(saturn_unlocked),
 	// [MiSTer-DB9-Pro END]
+	.ps2_key(ps2_key),
+
+	.img_mounted(img_mounted),
+	.img_readonly(img_readonly),
+	.img_size(img_size),
+
+	.sd_lba(sd_lba),
+	.sd_blk_cnt(sd_blk_cnt),
+	.sd_rd(sd_rd),
+	.sd_wr(sd_wr),
+	.sd_ack(sd_ack),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_din(sd_buff_din),
+	.sd_buff_wr(sd_buff_wr)
 );
 
 /////////////////  RESET  /////////////////////////
@@ -409,18 +461,20 @@ wire        ram_we_n, ram_ce_n;
 wire  [7:0] ram_di;
 wire  [7:0] ram_do;
 
-wire [14:0] ram_a = (extram)            ? cpu_ram_a       :
-                    (status[5:4] == 1)  ? cpu_ram_a[12:0] : // 8k
-                    (status[5:4] == 0)  ? cpu_ram_a[9:0]  : // 1k
-                    (sg1000)            ? cpu_ram_a[12:0] : // SGM means 8k on SG1000
-                                          cpu_ram_a;        // SGM/32k
+wire [14:0] ram_a_cpu = (extram)            ? cpu_ram_a       :
+                        (status[5:4] == 1)  ? cpu_ram_a[12:0] :
+                        (status[5:4] == 0)  ? cpu_ram_a[9:0]  :
+                        (sg1000)            ? cpu_ram_a[12:0] :
+                                              cpu_ram_a;
+
+wire [14:0] ram_a = ss_ram_sel ? ss_ram_a : ram_a_cpu;
 
 spram #(15) ram
 (
 	.clock(clk_sys),
 	.address(ram_a),
-	.wren(ce_10m7 & ~(ram_we_n | ram_ce_n)),
-	.data(ram_do),
+	.wren(ss_ram_sel ? (sd_buff_wr & ss_loading) : (ce_10m7 & ~(ram_we_n | ram_ce_n))),
+	.data(ss_ram_sel ? sd_buff_dout : ram_do),
 	.q(ram_di)
 );
 
@@ -432,9 +486,9 @@ wire  [7:0] vram_do;
 spram #(14) vram
 (
 	.clock(clk_sys),
-	.address(vram_a),
-	.wren(vram_we),
-	.data(vram_do),
+	.address(ss_vram_sel ? ss_vram_a : vram_a),
+	.wren(ss_vram_sel ? (sd_buff_wr & ss_loading) : vram_we),
+	.data(ss_vram_sel ? sd_buff_dout : vram_do),
 	.q(vram_di)
 );
 
@@ -444,6 +498,21 @@ wire        cart_rd;
 
 reg [5:0] cart_pages;
 always @(posedge clk_sys) if(ioctl_wr) cart_pages <= ioctl_addr[19:14];
+
+reg [31:0] rom_sum;
+reg [24:0] rom_len;
+always @(posedge clk_sys) begin
+	if(ioctl_wr) begin
+		if(!ioctl_addr) begin
+			rom_sum <= ioctl_dout;
+			rom_len <= 1;
+		end
+		else begin
+			rom_sum <= {rom_sum[30:0], rom_sum[31]} + ioctl_dout;
+			rom_len <= ioctl_addr + 1'd1;
+		end
+	end
+end
 
 assign SDRAM_CLK = ~clk_sys;
 sdram sdram
@@ -498,8 +567,12 @@ wire [7:0] R,G,B;
 wire hblank, vblank;
 wire hsync, vsync;
 
-wire [31:0] joya = status[3] ? joy1 : joy0;
-wire [31:0] joyb = status[3] ? joy0 : joy1;
+wire [31:0] joy0_m = joy0[20] ? 32'd0 : joy0;
+wire [31:0] joy1_m = joy1[20] ? 32'd0 : joy1;
+wire [31:0] joy_ss = (joy0[20] ? joy0 : 32'd0) | (joy1[20] ? joy1 : 32'd0);
+
+wire [31:0] joya = status[3] ? joy1_m : joy0_m;
+wire [31:0] joyb = status[3] ? joy0_m : joy1_m;
 
 cv_console console
 (
@@ -540,6 +613,16 @@ cv_console console
 	.cart_a_o(cart_a),
 	.cart_d_i(cart_d),
 	.cart_rd(cart_rd),
+
+	.ss_frz_i(ss_frz),
+	.ss_wr_i(ss_reg_wr),
+	.ss_a_i(sd_buff_addr[7:0]),
+	.ss_d_i(sd_buff_dout),
+	.ss_d_o(ss_reg_dout),
+	.ss_cpuset_i(ss_cpuset),
+	.ss_cpu_cen_p_i(ss_cen_p),
+	.ss_cpu_cen_n_i(ss_cen_n),
+	.ss_bnd_o(ss_bnd),
 
 	.border_i(status[6]),
 	.rgb_r_o(R),
@@ -587,7 +670,95 @@ video_mixer #(.LINE_LENGTH(290), .GAMMA(1)) video_mixer
 	.VBlank(vblank)
 );
 
+wire        ss_bnd;
+wire  [7:0] ss_reg_dout;
+wire        ss_frz;
+wire        ss_busy;
+wire        ss_loading;
+wire        ss_reg_wr;
+wire        ss_cpuset;
+wire        ss_cen_p;
+wire        ss_cen_n;
+wire        ss_ram_sel;
+wire        ss_vram_sel;
+wire [14:0] ss_ram_a;
+wire [13:0] ss_vram_a;
 
+reg         ss_mounted = 0;
+always @(posedge clk_sys) if(img_mounted) ss_mounted <= |img_size;
+
+wire       ss_key_save, ss_key_load, ss_info_req, ss_status_upd;
+wire [2:0] ss_slot;
+wire [7:0] ss_info;
+
+savestate_keys savestate_keys
+(
+	.clk(clk_sys),
+	.enable(~OSD_STATUS),
+	.ps2_key(ps2_key),
+	.joy_ss(joy_ss[20]),
+	.joy_right(joy_ss[0]),
+	.joy_left(joy_ss[1]),
+	.joy_down(joy_ss[2]),
+	.joy_up(joy_ss[3]),
+	.menu_slot(status[14:12]),
+	.osd_save(status[15]),
+	.osd_load(status[16]),
+	.save(ss_key_save),
+	.load(ss_key_load),
+	.slot(ss_slot),
+	.info_req(ss_info_req),
+	.info(ss_info),
+	.status_update(ss_status_upd)
+);
+
+savestate savestate
+(
+	.clk(clk_sys),
+	.reset(reset),
+
+	.save_req(ss_key_save),
+	.load_req(ss_key_load),
+	.slot(ss_slot),
+	.mounted(ss_mounted),
+	.readonly(img_readonly),
+
+	.bnd(ss_bnd),
+	.frz(ss_frz),
+	.cpuset(ss_cpuset),
+	.cen_p(ss_cen_p),
+	.cen_n(ss_cen_n),
+	.busy(ss_busy),
+	.loading(ss_loading),
+
+	.rom_sum(rom_sum),
+	.rom_len(rom_len),
+	.cart_pages(cart_pages),
+	.sg1000(sg1000),
+	.extram(extram),
+	.ram_size(status[5:4]),
+
+	.reg_wr(ss_reg_wr),
+	.reg_dout(ss_reg_dout),
+
+	.ram_sel(ss_ram_sel),
+	.vram_sel(ss_vram_sel),
+	.ram_a(ss_ram_a),
+	.vram_a(ss_vram_a),
+	.ram_di(ram_di),
+	.vram_di(vram_di),
+
+	.sd_lba(sd_lba[0]),
+	.sd_rd(sd_rd),
+	.sd_wr(sd_wr),
+	.sd_ack(sd_ack),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_din(sd_buff_din[0]),
+	.sd_buff_wr(sd_buff_wr)
+);
+
+assign sd_blk_cnt[0] = 0;
 
 ////////////////  Control  ////////////////////////
 
